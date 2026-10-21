@@ -1,3 +1,3 @@
 ---
 minor_changes:
-  - nb_inventory - Add ``primary_ip_interface`` option to expose the interface name of the primary IP as a host var without requiring ``interfaces`` to be enabled
+  - nb_inventory - Add ``primary_ip_interface`` option to expose the name of the interface the primary IP is assigned to as a host var. When none of ``interfaces``, ``dns_name`` or ``ansible_host_dns_name`` is set only the primary IP addresses are requested, not all IP addresses (https://github.com/netbox-community/ansible_modules/issues/1530).

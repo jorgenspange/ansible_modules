@@ -231,11 +231,14 @@ DOCUMENTATION = """
             default: false
         primary_ip_interface:
             description:
-                - If True, it adds the name of the interface associated with the primary IP as a host var named C(primary_ip_interface).
-                - Force IP Addresses to be fetched, similar to I(dns_name).
+                - If True, it adds the name of the interface the primary IP is assigned to as a host var named C(primary_ip_interface).
+                - This is informational only, it does not change how Ansible connects to the host, see I(ansible_host_dns_name) and I(dns_name) for that.
+                - Hosts without a primary IP, or whose primary IP is not assigned to an interface, do not get the host var.
+                - If I(interfaces), I(dns_name) or I(ansible_host_dns_name) is set the IP addresses fetched for those options are reused.
+                  Otherwise only the primary IP addresses of the fetched devices and virtual machines are requested, not all IP addresses.
             type: boolean
             default: false
-            version_added: "3.22.0"
+            version_added: "3.24.0"
         ansible_host_dns_name:
             description:
                 - If True, sets DNS Name (fetched from primary_ip) to be used in ansible_host variable, instead of IP Address.
@@ -1057,24 +1060,13 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         return ip_address.get("dns_name")
 
     def extract_primary_ip_interface(self, host):
+        # No primary IP assigned
         if not host.get("primary_ip"):
             return None
 
-        before_netbox_v29 = bool(self.ipaddresses_lookup)
-        if before_netbox_v29:
-            ip_address = self.ipaddresses_lookup.get(host["primary_ip"]["id"])
-        else:
-            if host["is_virtual"]:
-                ip_address = self.vm_ipaddresses_lookup.get(host["primary_ip"]["id"])
-            else:
-                ip_address = self.device_ipaddresses_lookup.get(
-                    host["primary_ip"]["id"]
-                )
-
-        if ip_address is None:
-            return None
-
-        return ip_address.get("interface_name")
+        # IP address ids are unique across devices and virtual machines.
+        # Don't assign a host_var if the primary IP is not assigned to an interface
+        return self.ip_interface_name_lookup.get(host["primary_ip"]["id"])
 
     def extract_serial(self, host):
         return host.get("serial", None)
@@ -1435,19 +1427,26 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
 
             self.vm_virtual_disks_lookup[vm_id][virtual_disk_id] = virtual_disk
 
-    def refresh_primary_ip_addresses(self):
-        self.ipaddresses_intf_lookup = defaultdict(dict)
-        self.ipaddresses_lookup = defaultdict(dict)
-        self.vm_ipaddresses_intf_lookup = defaultdict(dict)
-        self.vm_ipaddresses_lookup = defaultdict(dict)
-        self.device_ipaddresses_intf_lookup = defaultdict(dict)
-        self.device_ipaddresses_lookup = defaultdict(dict)
+    @staticmethod
+    def _ipaddress_interface_name(ipaddress):
+        # "assigned_object" replaces "interface" as of NetBox v2.9, and is null for unassigned IPs
+        assigned_object = ipaddress.get("assigned_object") or ipaddress.get("interface")
+        if not assigned_object:
+            return None
+        return assigned_object.get("name")
 
-        primary_ip_ids = [
-            host["primary_ip"]["id"]
-            for host in chain(self.devices_list, self.vms_list)
-            if host.get("primary_ip") and host["primary_ip"].get("id")
-        ]
+    def refresh_primary_ip_addresses(self):
+        # Only fetch the primary IPs of the fetched hosts, instead of every IP address,
+        # as that is all that is needed to find the interface name of the primary IP
+        self.ip_interface_name_lookup = {}
+
+        primary_ip_ids = sorted(
+            {
+                host["primary_ip"]["id"]
+                for host in chain(self.devices_list, self.vms_list)
+                if host.get("primary_ip") and host["primary_ip"].get("id")
+            }
+        )
 
         if not primary_ip_ids:
             return
@@ -1460,15 +1459,9 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         )
 
         for ipaddress in ipaddresses:
-            ip_id = ipaddress["id"]
-            interface_name = ipaddress.get("assigned_object", {}).get("name")
-
-            if ipaddress.get("assigned_object_type") == "virtualization.vminterface":
-                self.vm_ipaddresses_lookup[ip_id] = {"interface_name": interface_name}
-            else:
-                self.device_ipaddresses_lookup[ip_id] = {
-                    "interface_name": interface_name
-                }
+            interface_name = self._ipaddress_interface_name(ipaddress)
+            if interface_name:
+                self.ip_interface_name_lookup[ipaddress["id"]] = interface_name
 
     def refresh_interfaces(self):
         url_device_interfaces = self.api_endpoint + "/api/dcim/interfaces/?limit=0"
@@ -1564,12 +1557,17 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         self.vm_ipaddresses_lookup = defaultdict(dict)
         self.device_ipaddresses_intf_lookup = defaultdict(dict)
         self.device_ipaddresses_lookup = defaultdict(dict)
+        # Interface name of each IP address, for the primary_ip_interface option
+        self.ip_interface_name_lookup = {}
 
         for ipaddress in ipaddresses:
             # As of NetBox v2.9 "assigned_object_x" replaces "interface"
             if ipaddress.get("assigned_object_id"):
                 interface_id = ipaddress["assigned_object_id"]
                 ip_id = ipaddress["id"]
+                interface_name = self._ipaddress_interface_name(ipaddress)
+                if interface_name:
+                    self.ip_interface_name_lookup[ip_id] = interface_name
                 # We need to copy the ipaddress entry to preserve the original in case caching is used.
                 ipaddress_copy = ipaddress.copy()
 
@@ -1583,11 +1581,6 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
                     self.device_ipaddresses_intf_lookup[interface_id][
                         ip_id
                     ] = ipaddress_copy  # Remove "assigned_object_X" attributes, as that's redundant when ipaddress is added to an interface
-
-                if ipaddress.get("assigned_object"):
-                    ipaddress_copy["interface_name"] = ipaddress["assigned_object"].get(
-                        "name"
-                    )
 
                 del ipaddress_copy["assigned_object_id"]
                 del ipaddress_copy["assigned_object_type"]
@@ -1644,7 +1637,7 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
     def lookup_processes_secondary(self):
         lookups = []
 
-        # IP addresses are needed for either interfaces or dns_name options
+        # IP addresses are needed for either interfaces, dns_name or ansible_host_dns_name options
         if self.interfaces or self.dns_name or self.ansible_host_dns_name:
             lookups.append(self.refresh_ipaddresses)
         elif self.primary_ip_interface:
